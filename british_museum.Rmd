@@ -1,0 +1,325 @@
+---
+title: "Visits to the British Museum - trends & seasons"
+output: 
+  html_document:
+       theme: "sandstone"
+---
+```{r setup, include = FALSE}
+
+# A. Libraries
+
+library(tidyverse)
+library(readr)
+library(stringr)
+library(forecast)
+
+# B. Read & tidy data
+# Note: data is based on UK fiscal years from April - March 
+
+# read in data 
+# source: source: https://www.gov.uk/government/statistical-data-sets/museums-and-galleries-monthly-visits
+
+df_import <- read_csv("Monthly_Museums_October_2016_Published_December_2016.csv", col_names = TRUE, na = "-")
+colnames(df_import) <- c("institution", 2004:2016) 
+
+# prepare lookup table for months as numeric (see below)
+months_lookup <- data.frame(month_name = month.name, month = 1:12)
+months_lookup$month_name <- as.character(months_lookup$month_name)
+months_lookup$month_abb <- as.character(month.abb)
+
+# create base data frame
+df_base <- df_import %>%
+  gather(key = year, value = visits, `2004`:`2016`) %>% # tidy data; year values are preliminary (see below)
+  mutate(month_name = ifelse(str_extract(institution, "[^_]*$") %in% month.name, str_extract(institution, "[^_]*$"), NA))  %>% # extract month from institution name
+  left_join(months_lookup, by = "month_name") %>% # lookup months as numeric
+  filter(!is.na(month)) %>% # filter NAs on months; removes totals
+  mutate(year = ifelse(month < 4, as.numeric(year) + 1, as.numeric(year))) %>% # converts from UK fiscal year to calendar year
+  mutate(bm = grepl("BRITISH_MUSEUM", institution)) %>% # ID for British Museum
+  filter(bm == TRUE) %>% # filter British Museum
+  mutate(institution = "British Museum") %>% # tidy institution name
+  select(institution, year, month, visits) %>% # select required variables
+  arrange(institution, year, month) 
+
+# validate base data frame
+apply(df_base, 2, function(x) sum(is.na(x)))
+df_base[is.na(df_base$visits),] # NA values are as expected
+
+# C. Create time series object for British Museum data
+# convert visits to 1000 unit
+
+# full data is ragged array
+bm_full <- ts(df_base$visits/1000, start = c(2004,4), end = c(2016,10), frequency = 12)
+bm_full
+
+# shorter time window and tidy array for analysis 
+bm <- window(bm_full, start = c(2010, 1), end = c(2015,12), frequency = 12) 
+```
+
+**1. Introduction**
+
+The [British Museum](http://www.britishmuseum.org/) is well-known as a venerable institution. Even so, the [visitor stats](https://www.gov.uk/government/statistical-data-sets/museums-and-galleries-monthly-visits) published by the UK Government are pretty impressive. Topping the list of attractions, the British Museum has had annual visitor numbers over 5 million for the past few years. This post takes a brief look at trends over time and seasonal patterns in visitor volumes. 
+
+**2. Exploratory Analysis**
+
+The plot below gives a first glimpse of the patterns in visits to the British Museum.
+
+```{r ts, include = FALSE}
+df_ts <- df_base %>%
+  filter(year > 2009 & year < 2016) %>%
+  mutate(month = str_pad(month, width=2, pad="0")) %>%
+  mutate(date = as.Date(paste(year, month, "01", sep = "-"))) 
+```
+
+```{r plot1, echo = FALSE} 
+ggplot(df_ts, aes(x = date, y = (visits/1000))) +
+  geom_line(color = "orange") +
+  xlab("") +
+  ylab("Visits (1000s)") +
+  labs(title = "Visits to British Museum, 2010 - 2015") +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+The plot suggests marked seasonal patterns. The series tends to peak in summer and enter a trough in winter, with regular spikes in spring months and October. The level of the series also seems to change part way: after maintaining a similar level from 2010 - 2012, the series seems to shift up in the period from 2013 - 2015. 
+
+The autocorrelation plot below casts some further light on the characteristics of the time series. 
+
+```{r plot2, echo = FALSE}
+
+Acf(bm, 
+    main = "ACF plot for monthly visits to British Museum, 2010 - 2015")
+
+```
+
+The most significant positive and negative correlations cluster around the lagged values at 6, 12 18 and 24 months, an oscillating pattern that suggests a systematic difference in volumes between summer and winter. The rough symmetry of the oscillating pattern also suggests that the seasonal variation may be considered a more influential component of the time series than the trend. 
+
+```{r ana1, include = FALSE}
+
+# initial data summaries
+
+# create data frame for summaries 
+dmn <- list(month.abb, unique(floor(time(bm))))
+df_bm <- as.data.frame(t(matrix(bm, 12, dimnames = dmn)))
+df_bm$year <- as.numeric(row.names(df_bm))
+df_bm$yr_total <- rowSums(df_bm[1:12])
+
+# yearly totals
+
+barplot(df_bm$yr_total,
+        names.arg = c(df_bm$year),
+        main = "Total visits to British Museum, 2006 - 2015",
+        ylab = "Visits (1000s)")
+
+# monthly means and distributions
+
+seasonplot(bm,  
+           main = "Monthly visits to British Museum, 2006 - 2015",
+           ylab = "Visits (1000s)")
+
+barplot(round(colMeans(df_bm[1:12]),0),
+        main = "Mean visits to British Museum by month, 2006 - 2015",
+        ylab = "Visits (1000s)")
+
+boxplot(df_bm[1:12], 
+        main = "Distributions for monthly visits to British Museum, 2006 - 2015",
+        ylab = "Visits (1000s)")
+
+#  monthly outliers
+
+df_bm[df_bm$Jan == min(df_bm$Jan), c(1,13)]
+df_bm[df_bm$Nov == min(df_bm$Nov), c(11,13)]
+df_bm[df_bm$Nov == max(df_bm$Nov), c(11,13)]
+
+# examining annual extremes(peaks and troughs) prior to autocorrelation
+
+annual_extremes <- df_bm %>%
+  select(year, Jan:Dec) %>%
+  gather(key = month, value = visits, Jan:Dec) %>%
+  filter(year >= 2010) %>%
+  group_by(year) %>%
+  mutate(extreme = ifelse(visits == max(visits), "peak",
+                          ifelse(visits == min(visits), "trough", NA))) %>%
+  filter(!is.na(extreme)) %>%
+  select(year, extreme, month, visits) %>%
+  arrange(year, extreme)
+
+annual_extremes
+
+```
+
+Further numerical summaries and secondary plots (see .rmd code) highlight some additional details that are less easy to spot in the plots above: 
+
+* 2012 is an anomalous year as its peak occurs in April, quite far removed from the typical peak months of July and August.
+* Outlier values occur in 2011 (Nov is unsually low), 2013 (Jan is low) and 2015 (Nov is high).
+
+When attempting to model this data, we need a method that can accomodate (potentially changing) trend and seasonal components and is robust to the impact of outliers. A typical approach in this situation is to use Seasonal Trend Decomposition using LOESS (STL). 
+
+**3. Seasonal-Trend Decomposition**
+
+STL is an algorithm that is used to decompose a time series into three parts: seasonal, trend and random components. The output is seasonal and trend values for each observation, plus a remainder term for variation in the data that has not already been accounted for. These components can be analyzed and plotted separately, as demonstrated below. 
+
+To fit an STL model, we first specify the periodicity to detect monthly variation; in R, this is simply the frequency of the time series object (12). The next step is to determine the extent to which variability will be reflected in sensitivity in either the seasonal or trend subseries. This is an iterative process in which the analyst can use different approaches to decide which model is most useful given the observed data.
+
+In this case, a broad set of models were fit. A fixed model with an unvarying seasonal component was fitted as a default. Then a set of variable models were fit with varying degrees of sensitivity to monthly variation. The characteristics of models with low mean and median error (values for the random component) were compared. Finally the model with the lowest mean error was selected for side-by-side comparison with the default fixed model. 
+
+```{r fitmodels, include = FALSE}
+
+# time series decomposition
+
+fit <- stl(bm, s.window = "periodic", robust = TRUE)
+fit_s <- fit$time.series[,"seasonal"]
+fit_t <- fit$time.series[,"trend"]
+fit_r <- fit$time.series[,"remainder"]
+  
+sim_swindow <- function(x) {
+  f <- stl(bm, s.window = (x), robust = TRUE)   
+  r <- f$time.series[,"remainder"]
+  df <- data.frame(window = (x), mean_remainder = mean(r), median_remainder = median(r))
+  
+}
+
+w_list <- lapply(c(5:25), sim_swindow)
+w_df <- do.call(rbind.data.frame, w_list)
+
+# compare graphically 
+
+# select model with lowest mean
+
+fitv <- stl(bm, s.window = 14, robust = TRUE)
+fitv_s <- fitv$time.series[,"seasonal"]
+fitv_t <- fitv$time.series[,"trend"]
+fitv_r <- fitv$time.series[,"remainder"]
+
+# summarise
+
+summary(fit_r)
+summary(fitv_r)
+
+# plots
+
+plot(fit)
+plot(fitv)
+
+# ACF residual plots
+
+Acf(fit_r, 
+    main = "ACF plot for residuals of time series decomposition (fixed season)")
+
+Acf(fitv_r, 
+    main = "ACF plot for residuals of time series decomposition (variable seaonality)")
+
+```
+
+The time series plot below compares the trend lines of the fixed and variable models. 
+
+```{r trend, include = FALSE}
+
+df_trends <- df_base %>%
+  filter(year > 2009 & year < 2016) %>%
+  mutate(month = str_pad(month, width=2, pad="0")) %>%
+  mutate(date = as.Date(paste(year, month, "01", sep = "-"))) %>%
+  mutate(fixed = fit_t) %>%
+  mutate(variable = fitv_t) %>%
+  gather(key = model, value = trend, fixed:variable)
+```
+
+```{r plot3, echo = FALSE}
+
+ggplot(df_trends, aes(x = date, y = (visits/1000))) +
+  geom_line(color = "dark grey") +
+  geom_line(aes(x = date, y = trend, color = model), linetype = 2, size = 1) +
+  xlab("") +
+  ylab("Visits (1000s)") +
+  labs(title = "Monthly visits to British Museum, 2010 - 2015", 
+       subtitle = "Trend lines for fixed and variable seasonality models") + 
+  theme(plot.title = element_text(hjust = 0.5), 
+        plot.subtitle = element_text(hjust = 0.5))   
+```
+
+We can see that both trend lines are similar in describing a relatively stable level from 2010 - 2012, an increase in 2013 that is then maintained in 2014 and then increases again in 2015. 
+
+The plot below shows the seasonal components for fixed and variable seasonality models. Whilst a single value is shown for the fixed model, multiple values are overplotted for the variable model to indicate how the monthly component varies across the time series. 
+
+```{r season, include = FALSE}
+month_factor <- factor(months_lookup$month_abb, levels=unique(months_lookup$month_abb))
+df_seas <- data.frame(month_name = rep(month_factor,6),
+                      year = df_base$year[df_base$year > 2009 & df_base$year < 2016], 
+                      fixed = as.numeric(fit_s),  
+                      variable = as.numeric(fitv_s)) 
+df_seas <- df_seas %>%
+  gather(key = model, value = impact, fixed:variable)
+```
+
+```{r plot4, echo = FALSE} 
+ggplot(df_seas, aes(x = month_name, y = impact, color = model)) +
+  geom_point(alpha = 0.1, size = 4) +  
+  geom_abline(intercept = 0, slope = 0, linetype = 2, color = "dark grey") +
+  xlab("") +
+  ylab("Monthly impact (1000s)") +
+  labs(title = "Monthly variation in visits to British Museum, 2010 - 2015",
+       subtitle = "Seasonal components for fixed and variable seasonality models") +  
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5)) 
+```
+
+We can see that the fixed and variable models overlap to a considerable degree and that the monthly values do not change dramatically in the variable model.  
+
+Finally, we can explore the patterns of error in both models using the residual plot below.
+
+```{r resids, include = FALSE}
+df_resids <- data.frame(month_name = rep(month_factor,6),
+                      year = df_base$year[df_base$year > 2009 & df_base$year < 2016], 
+                      fixed = as.numeric(fit_r),  
+                      variable = as.numeric(fitv_r)) 
+
+df_resids <- df_resids %>%
+  gather(key = model, value = residual, fixed:variable)
+```
+
+```{r plot5, echo = FALSE}
+ggplot(df_resids, aes(x = month_name, y = residual, color = model)) +
+  geom_point(alpha = 0.4, size = 2) +
+  geom_abline(intercept = 0, slope = 0, linetype = 2, color = "dark grey") +
+  xlab("") +
+  ylab("Residual (1000 visits)") +
+  labs(title = "Residuals for fixed and variable seasonality models, grouped by month") +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+We can again see that the fixed and variable models produce largely similar results.  Large residuals occur for instances of July and August in 2012: as noted, this year was unusual in that its peak occured in spring (April) rather than the summer months. 
+
+Comparing the two models, it seems that the added complexity of the variable model does not yield significant benefits. This is perhaps not suprising given that the underlying data suggested relatively stable monthly patterns and that the variable model was only based on 6 observations for each month. For this reason, we would prefer the simplicity of the fixed model. 
+
+Using this approach, the plot below summarizes the typical impact of monthly seasonality on visits to the British museum from 2010-2015. 
+
+```{r plot6, echo = FALSE}
+
+ggplot(df_seas[df_seas$model=="fixed",],
+       aes(x = month_name, y = impact, fill = impact)) +
+  geom_bar(stat = "identity", width = 0.75, alpha = 0.75) +  
+  xlab("") +
+  ylab("Monthly impact (1000s)") +
+  labs(title = "Monthly variation in visits to British Museum, 2010 - 2015") +  
+  theme(plot.title = element_text(hjust = 0.5)) 
+```
+
+```{r save, include = FALSE}
+ggsave("bm_visits.PNG")
+```
+
+**Conclusion**
+
+The fixed-seasonality model provides a simple and well-performing option for this time series. By decomposing the time series, we can see more clearly the nature of the trend and monthly seasonal variation.
+
+The current trend level of visits to the British museum has increased by over 50,000 visits per month from its level in 2010 - 2012. Seasonal variation is particularly prominent, ranging from a positive impact greater than + 750,000 visits in July and August and a negative impact greater than - 500,000 visits in the November, December and January. As a model, however, it is a simplified representation of the actual time series and includes an error component that is usually between + / - 50,000 visits per month. 
+
+**Acknowledgements**
+
+Reference: 
+
+* *Forecasting: principles and practice*, by Rob J Hyndman and George Athanasopoulos, available online at: https://www.otexts.org/fpp
+
+* Useful demonstrations of STL modelling provided in Dillon R. Gardner's blog, available online at: http://www.gardner.fyi/blog/ 
+
+Data: UK Government
+
+R: R core development team; Rstudio; R packages contributed by Hadley Wickham and Rob Hyndman. 
